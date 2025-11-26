@@ -22,6 +22,8 @@
 #include <chrono>
 
 #include <glog/logging.h>
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 
 #include "platform/proto/resdb.pb.h"
 
@@ -236,6 +238,8 @@ void ConsensusManagerRaft::HeartbeatLoop() {
       // still in flight.
       bool expected = false;
       if (heartbeat_task_active_.compare_exchange_strong(expected, true)) {
+        heartbeat_inflight_started_ns_.store(
+            absl::ToUnixNanos(absl::Now()), std::memory_order_relaxed);
         std::thread([this]() {
           try {
             heartbeat_task_();
@@ -244,10 +248,29 @@ void ConsensusManagerRaft::HeartbeatLoop() {
           } catch (...) {
             LOG(ERROR) << "[RAFT] heartbeat task threw unknown exception";
           }
+          heartbeat_inflight_started_ns_.store(0, std::memory_order_relaxed);
           heartbeat_task_active_.store(false);
         }).detach();
       } else {
-        LOG(WARNING) << "[RAFT] skipping heartbeat: previous send still active";
+        // Watchdog: if the in-flight heartbeat has taken too long, clear it so
+        // the ticker can continue.
+        uint64_t start_ns =
+            heartbeat_inflight_started_ns_.load(std::memory_order_relaxed);
+        uint64_t now_ns = absl::ToUnixNanos(absl::Now());
+        const uint64_t max_ns =
+            absl::ToInt64Nanoseconds(absl::Milliseconds(500));
+        if (start_ns > 0 && now_ns > start_ns &&
+            (now_ns - start_ns) > max_ns) {
+          LOG(WARNING)
+              << "[RAFT] heartbeat stuck for "
+              << (now_ns - start_ns) / 1000000
+              << "ms; clearing in-flight flag to continue ticks";
+          heartbeat_task_active_.store(false);
+          heartbeat_inflight_started_ns_.store(0, std::memory_order_relaxed);
+        } else {
+          LOG(WARNING)
+              << "[RAFT] skipping heartbeat: previous send still active";
+        }
       }
     }
     lk.lock();

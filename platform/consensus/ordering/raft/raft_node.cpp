@@ -580,6 +580,14 @@ int RaftNode::HandleAppendEntriesResponse(
 int RaftNode::HandleRequestVoteRequest(
     const Request& envelope, const raft::RequestVoteRequest& request) {
   std::lock_guard<std::mutex> lk(state_mutex_);
+  LOG(ERROR) << "[RAFT] node " << self_id_
+             << " received RequestVote from " << request.candidate_id()
+             << " term=" << request.term()
+             << " last_log_term=" << request.last_log_term()
+             << " last_log_index=" << request.last_log_index()
+             << " current_term=" << current_term_
+             << " voted_for=" << voted_for_
+             << " sender=" << envelope.sender_id();
   raft::RequestVoteResponse response;
   response.set_responder_id(self_id_);
 

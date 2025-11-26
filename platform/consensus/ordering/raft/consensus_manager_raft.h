@@ -80,6 +80,10 @@ class ConsensusManagerRaft : public ConsensusManager {
   void SetHeartbeatTask(HeartbeatTask task);
 
   void UpdateLeadership(uint32_t leader_id, uint64_t term);
+  // Exposed for monitoring/tests.
+  uint64_t LastHeartbeatStartNanos() const {
+    return heartbeat_inflight_started_ns_.load(std::memory_order_relaxed);
+  }
 
   RaftLog* GetRaftLog() { return raft_log_.get(); }
   RaftPersistentState* GetPersistentState() {
@@ -117,6 +121,8 @@ class ConsensusManagerRaft : public ConsensusManager {
   std::condition_variable heartbeat_cv_;
   // Protects against re-entering a heartbeat send if the prior one blocks.
   std::atomic<bool> heartbeat_task_active_{false};
+  // Monotonic timestamp (ns) when the current heartbeat started, for watchdog.
+  std::atomic<uint64_t> heartbeat_inflight_started_ns_{0};
   std::atomic<bool> heartbeat_running_{false};
   std::atomic<uint32_t> leader_id_{0};
   std::atomic<uint64_t> current_term_{0};
