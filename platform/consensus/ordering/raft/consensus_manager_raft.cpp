@@ -54,10 +54,10 @@ ConsensusManagerRaft::ConsensusManagerRaft(
     LOG(WARNING) << "Transaction manager storage unavailable; RAFT state will "
                     "not be persisted.";
   }
-  // Use short-connection ReplicaCommunicator for RAFT RPCs; more reliable for
-  // vote responses in this setup.
+  // Use long-connection ReplicaCommunicator for RAFT RPCs to avoid blocking
+  // the heartbeat loop on repeated socket setup.
   raft_rpc_client_ =
-      GetReplicaClient(config_.GetReplicaInfos(), /*is_use_long_conn=*/false);
+      GetReplicaClient(config_.GetReplicaInfos(), /*is_use_long_conn=*/true);
   raft_rpc_ = std::make_unique<RaftRpc>(config_, raft_rpc_client_.get());
 
   raft_node_ = std::make_unique<RaftNode>(
@@ -231,7 +231,24 @@ void ConsensusManagerRaft::HeartbeatLoop() {
   while (heartbeat_running_) {
     lk.unlock();
     if (heartbeat_task_) {
-      heartbeat_task_();
+      // Run the heartbeat task in a fire-and-forget fashion so a blocked send
+      // does not stall the ticker thread. Skip if the previous heartbeat is
+      // still in flight.
+      bool expected = false;
+      if (heartbeat_task_active_.compare_exchange_strong(expected, true)) {
+        std::thread([this]() {
+          try {
+            heartbeat_task_();
+          } catch (const std::exception& e) {
+            LOG(ERROR) << "[RAFT] heartbeat task threw exception: " << e.what();
+          } catch (...) {
+            LOG(ERROR) << "[RAFT] heartbeat task threw unknown exception";
+          }
+          heartbeat_task_active_.store(false);
+        }).detach();
+      } else {
+        LOG(WARNING) << "[RAFT] skipping heartbeat: previous send still active";
+      }
     }
     lk.lock();
     heartbeat_cv_.wait_for(lk, std::chrono::milliseconds(200), [this]() {

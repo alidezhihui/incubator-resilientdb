@@ -115,6 +115,8 @@ class ConsensusManagerRaft : public ConsensusManager {
   std::thread raft_heartbeat_thread_;
   std::mutex heartbeat_mutex_;
   std::condition_variable heartbeat_cv_;
+  // Protects against re-entering a heartbeat send if the prior one blocks.
+  std::atomic<bool> heartbeat_task_active_{false};
   std::atomic<bool> heartbeat_running_{false};
   std::atomic<uint32_t> leader_id_{0};
   std::atomic<uint64_t> current_term_{0};
