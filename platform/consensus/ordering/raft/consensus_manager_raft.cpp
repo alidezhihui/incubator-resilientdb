@@ -81,6 +81,8 @@ ConsensusManagerRaft::ConsensusManagerRaft(
   SetHeartbeatTask([this]() {
     if (raft_node_) {
       raft_node_->HeartbeatTick();
+    } else {
+      LOG(ERROR) << "RAFT node not initialized; cannot perform heartbeat tick.";
     }
   });
 }
@@ -261,14 +263,14 @@ void ConsensusManagerRaft::HeartbeatLoop() {
             absl::ToInt64Nanoseconds(absl::Milliseconds(500));
         if (start_ns > 0 && now_ns > start_ns &&
             (now_ns - start_ns) > max_ns) {
-          LOG(WARNING)
+          LOG(ERROR)
               << "[RAFT] heartbeat stuck for "
               << (now_ns - start_ns) / 1000000
               << "ms; clearing in-flight flag to continue ticks";
           heartbeat_task_active_.store(false);
           heartbeat_inflight_started_ns_.store(0, std::memory_order_relaxed);
         } else {
-          LOG(WARNING)
+          LOG(ERROR)
               << "[RAFT] skipping heartbeat: previous send still active";
         }
       }

@@ -137,6 +137,12 @@ int RaftNode::HandleConsensusMessage(std::unique_ptr<Context> context,
                    << " failed to parse AppendEntriesResponse";
         return -1;
       }
+      LOG(ERROR) << "[RAFT] node " << self_id_
+                 << " received AppendEntriesResponse from "
+                 << rpc.responder_id() << " term=" << rpc.term()
+                 << " success=" << rpc.success()
+                 << " match_index=" << rpc.match_index()
+                 << " conflict_index=" << rpc.conflict_index();
       return HandleAppendEntriesResponse(rpc);
     }
     case raft::RAFT_REQUEST_VOTE_REQUEST: {
@@ -253,6 +259,7 @@ void RaftNode::StartElection() {
 }
 
 void RaftNode::BecomeFollower(uint64_t term, uint32_t leader_id) {
+  // Caller must hold state_mutex_.
   if (role_ != Role::kFollower) {
     LOG(ERROR) << "[RAFT] node " << self_id_ << " role change "
                << static_cast<int>(role_) << " -> follower term=" << term
@@ -340,6 +347,8 @@ void RaftNode::BroadcastAppendEntries(bool send_all_entries) {
   uint32_t leader_id = self_id_;
   auto next_index = next_index_;
   auto last_log_index = raft_log_->LastLogIndex();
+  // Release the state lock before doing network I/O so heartbeats are not
+  // blocked by outbound sends.
   lk.unlock();
 
   for (const auto& replica : replicas_) {
@@ -382,12 +391,15 @@ void RaftNode::BroadcastAppendEntries(bool send_all_entries) {
                    << " entries=" << rpc.entries_size()
                    << " leader_commit=" << rpc.leader_commit();
       }
+    } else {
+      LOG(ERROR) << "Raft RPC not initialized; cannot send AppendEntries to "
+                 << replica.id();
     }
   }
 }
 
 void RaftNode::MaybeAdvanceCommitIndex() {
-  std::lock_guard<std::mutex> lk(state_mutex_);
+  std::unique_lock<std::mutex> lk(state_mutex_);
   if (role_ != Role::kLeader) {
     return;
   }
@@ -405,15 +417,16 @@ void RaftNode::MaybeAdvanceCommitIndex() {
       commit_index_ = index;
     }
   }
-  if (auto status = raft_log_->CommitTo(commit_index_); !status.ok()) {
-    LOG(ERROR) << "Failed to commit log to index " << commit_index_ << ": "
-               << status;
+  // Snapshot the commit index under the lock, then release before I/O.
+  uint64_t commit = commit_index_;
+  lk.unlock();
+  if (auto status = raft_log_->CommitTo(commit); !status.ok()) {
+    LOG(ERROR) << "Failed to commit log to index " << commit << ": " << status;
     return;
   }
-  persistent_state_->SetCommitIndex(commit_index_);
+  persistent_state_->SetCommitIndex(commit);
   if (auto status = persistent_state_->Store(); !status.ok()) {
-    LOG(ERROR) << "Failed to persist commit index " << commit_index_ << ": "
-               << status;
+    LOG(ERROR) << "Failed to persist commit index " << commit << ": " << status;
     return;
   }
   ApplyEntries();
@@ -469,7 +482,7 @@ int RaftNode::HandleAppendEntriesRequest(
              << " prev_term=" << request.prev_log_term()
              << " entries=" << request.entries_size()
              << " leader_commit=" << request.leader_commit();
-  std::lock_guard<std::mutex> lk(state_mutex_);
+  std::unique_lock<std::mutex> lk(state_mutex_);
   if (request.term() < current_term_) {
     raft::AppendEntriesResponse response;
     response.set_term(current_term_);
@@ -538,7 +551,14 @@ int RaftNode::HandleAppendEntriesRequest(
     response.set_match_index(raft_log_->LastLogIndex());
   }
 
+  lk.unlock();
   if (auto replica = ReplicaById(envelope.sender_id()); replica && raft_rpc_) {
+    LOG(ERROR) << "[RAFT] node " << self_id_
+               << " sending AppendEntriesResponse to " << replica->id()
+               << " term=" << response.term()
+               << " success=" << response.success()
+               << " match_index=" << response.match_index()
+               << " conflict_index=" << response.conflict_index();
     absl::Status status =
         raft_rpc_->SendAppendEntriesResponse(response, *replica);
     if (!status.ok()) {
@@ -579,7 +599,7 @@ int RaftNode::HandleAppendEntriesResponse(
 
 int RaftNode::HandleRequestVoteRequest(
     const Request& envelope, const raft::RequestVoteRequest& request) {
-  std::lock_guard<std::mutex> lk(state_mutex_);
+  std::unique_lock<std::mutex> lk(state_mutex_);
   LOG(ERROR) << "[RAFT] node " << self_id_
              << " received RequestVote from " << request.candidate_id()
              << " term=" << request.term()
@@ -625,6 +645,7 @@ int RaftNode::HandleRequestVoteRequest(
              << " log_ok=" << (response.vote_granted() ? "true" : "false")
              << " granted=" << response.vote_granted();
 
+  lk.unlock();
   if (auto replica = ReplicaById(envelope.sender_id()); replica && raft_rpc_) {
     absl::Status status =
         raft_rpc_->SendRequestVoteResponse(response, *replica);
