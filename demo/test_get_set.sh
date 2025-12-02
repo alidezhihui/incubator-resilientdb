@@ -17,11 +17,10 @@ echo "=== Non-versioned set/get ==="
 echo
 echo "=== Version-based set/get ==="
 KEY="vkey_demo"
-# First Version
+
 "$KV_TOOL" --config "$CLIENT_CFG" --cmd set_with_version --key "$KEY" --version 0 --value Alice
 "$KV_TOOL" --config "$CLIENT_CFG" --cmd set_with_version --key "$KEY" --version 1 --value Bob
 
-# Second Version
 "$KV_TOOL" --config "$CLIENT_CFG" --cmd get_with_version --key "$KEY" --version 0
 "$KV_TOOL" --config "$CLIENT_CFG" --cmd get_with_version --key "$KEY" --version 1
 
