@@ -203,16 +203,9 @@ int ConsensusManagerRaft::HandleCustomConsensus(
                << request->user_type();
     return -1;
   }
-<<<<<<< HEAD
   LOG(ERROR) << "[RAFT] Replica " << config_.GetSelfInfo().id()
              << " received RAFT custom message seq=" << request->seq()
              << " type=" << request->user_type();
-=======
-  LOG(ERROR) << "[RAFT_RPC] NODE " << config_.GetSelfInfo().id()
-             << " received custom consensus message user_type="
-             << request->user_type()
-             << " from sender=" << request->sender_id();
->>>>>>> master
   if (consensus_message_handler_) {
     return consensus_message_handler_(std::move(context), std::move(request));
   }
