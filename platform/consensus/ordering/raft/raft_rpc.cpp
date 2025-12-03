@@ -95,10 +95,9 @@ absl::Status RaftRpc::Send(const google::protobuf::Message& payload,
   } else {
     rc = communicator_->SendMessage(envelope, *replica);
   }
-  if (rc != 0) {
-    LOG(ERROR) << "[RAFT_RPC] NODE " << self_id
-               << " failed to send RAFT RPC user_type=" << user_type
-               << " rc=" << rc;
+  // communicator_->SendMessage returns a non-negative count of successes;
+  // only negative values indicate failure.
+  if (rc < 0) {
     return absl::InternalError("failed to send RAFT RPC");
   }
   return absl::OkStatus();

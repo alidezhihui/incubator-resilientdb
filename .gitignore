@@ -20,4 +20,5 @@ apache_release
 resdb/
 100*_db/
 gmon.out
-.history/TODO.txt
+.history/
+*.pid

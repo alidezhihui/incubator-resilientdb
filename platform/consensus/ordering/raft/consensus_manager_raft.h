@@ -58,6 +58,8 @@ class ConsensusManagerRaft : public ConsensusManager {
 
   int ConsensusCommit(std::unique_ptr<Context> context,
                       std::unique_ptr<Request> request) override;
+  int Dispatch(std::unique_ptr<Context> context,
+               std::unique_ptr<Request> request) override;
 
   std::vector<ReplicaInfo> GetReplicas() override;
   uint32_t GetPrimary() override;
@@ -78,6 +80,10 @@ class ConsensusManagerRaft : public ConsensusManager {
   void SetHeartbeatTask(HeartbeatTask task);
 
   void UpdateLeadership(uint32_t leader_id, uint64_t term);
+  // Exposed for monitoring/tests.
+  uint64_t LastHeartbeatStartNanos() const {
+    return heartbeat_inflight_started_ns_.load(std::memory_order_relaxed);
+  }
 
   RaftLog* GetRaftLog() { return raft_log_.get(); }
   RaftPersistentState* GetPersistentState() {
@@ -89,6 +95,9 @@ class ConsensusManagerRaft : public ConsensusManager {
   RaftRpc* GetRpc() { return raft_rpc_.get(); }
 
  private:
+  // Helper to get a short-connection ReplicaCommunicator for RAFT RPCs.
+  std::unique_ptr<ReplicaCommunicator> GetShortConnClient();
+
   int HandleClientRequest(std::unique_ptr<Context> context,
                           std::unique_ptr<Request> request);
   int HandleCustomQuery(std::unique_ptr<Context> context,
@@ -110,6 +119,10 @@ class ConsensusManagerRaft : public ConsensusManager {
   std::thread raft_heartbeat_thread_;
   std::mutex heartbeat_mutex_;
   std::condition_variable heartbeat_cv_;
+  // Protects against re-entering a heartbeat send if the prior one blocks.
+  std::atomic<bool> heartbeat_task_active_{false};
+  // Monotonic timestamp (ns) when the current heartbeat started, for watchdog.
+  std::atomic<uint64_t> heartbeat_inflight_started_ns_{0};
   std::atomic<bool> heartbeat_running_{false};
   std::atomic<uint32_t> leader_id_{0};
   std::atomic<uint64_t> current_term_{0};
@@ -117,6 +130,7 @@ class ConsensusManagerRaft : public ConsensusManager {
   std::unique_ptr<RaftLog> raft_log_;
   std::unique_ptr<RaftPersistentState> persistent_state_;
   std::unique_ptr<RaftSnapshotManager> snapshot_manager_;
+  std::unique_ptr<ReplicaCommunicator> raft_rpc_client_;
   std::unique_ptr<RaftRpc> raft_rpc_;
   std::unique_ptr<RaftNode> raft_node_;
 };

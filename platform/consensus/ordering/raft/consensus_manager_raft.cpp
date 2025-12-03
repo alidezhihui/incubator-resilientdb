@@ -22,6 +22,8 @@
 #include <chrono>
 
 #include <glog/logging.h>
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 
 #include "platform/proto/resdb.pb.h"
 
@@ -39,7 +41,7 @@ ConsensusManagerRaft::ConsensusManagerRaft(
   Storage* storage =
       transaction_manager_ ? transaction_manager_->GetStorage() : nullptr;
   if (storage != nullptr) {
-    raft_log_ = std::make_unique<RaftLog>(storage);
+  raft_log_ = std::make_unique<RaftLog>(storage);
     auto status = raft_log_->LoadFromStorage();
     if (!status.ok()) {
       LOG(WARNING) << "Failed to load persisted RAFT log: " << status;
@@ -54,7 +56,11 @@ ConsensusManagerRaft::ConsensusManagerRaft(
     LOG(WARNING) << "Transaction manager storage unavailable; RAFT state will "
                     "not be persisted.";
   }
-  raft_rpc_ = std::make_unique<RaftRpc>(config_, GetBroadCastClient());
+  // Use long-connection ReplicaCommunicator for RAFT RPCs to avoid blocking
+  // the heartbeat loop on repeated socket setup.
+  raft_rpc_client_ =
+      GetReplicaClient(config_.GetReplicaInfos(), /*is_use_long_conn=*/true);
+  raft_rpc_ = std::make_unique<RaftRpc>(config_, raft_rpc_client_.get());
 
   raft_node_ = std::make_unique<RaftNode>(
       config_, this, transaction_manager_.get(), raft_log_.get(),
@@ -75,6 +81,8 @@ ConsensusManagerRaft::ConsensusManagerRaft(
   SetHeartbeatTask([this]() {
     if (raft_node_) {
       raft_node_->HeartbeatTick();
+    } else {
+      LOG(ERROR) << "RAFT node not initialized; cannot perform heartbeat tick.";
     }
   });
 }
@@ -91,16 +99,29 @@ int ConsensusManagerRaft::ConsensusCommit(std::unique_ptr<Context> context,
   switch (request->type()) {
     case Request::TYPE_CLIENT_REQUEST:
     case Request::TYPE_NEW_TXNS:
+      LOG(ERROR) << "[RAFT] Replica " << config_.GetSelfInfo().id()
+                 << " received client request seq=" << request->seq()
+                 << " user_seq=" << request->user_seq()
+                 << " type=" << request->type()
+                 << " payload_bytes=" << request->data().size();
       return HandleClientRequest(std::move(context), std::move(request));
     case Request::TYPE_CUSTOM_QUERY:
       return HandleCustomQuery(std::move(context), std::move(request));
     case Request::TYPE_CUSTOM_CONSENSUS:
       return HandleCustomConsensus(std::move(context), std::move(request));
     default:
-      LOG(WARNING) << "ConsensusManagerRaft received unsupported request type: "
+      LOG(ERROR) << "ConsensusManagerRaft received unsupported request type: "
                    << request->type();
       return -1;
   }
+}
+
+int ConsensusManagerRaft::Dispatch(std::unique_ptr<Context> context,
+                                   std::unique_ptr<Request> request) {
+  if (request->type() == Request::TYPE_CUSTOM_CONSENSUS) {
+    return HandleCustomConsensus(std::move(context), std::move(request));
+  }
+  return ConsensusManager::Dispatch(std::move(context), std::move(request));
 }
 
 std::vector<ReplicaInfo> ConsensusManagerRaft::GetReplicas() {
@@ -137,6 +158,8 @@ void ConsensusManagerRaft::UpdateLeadership(uint32_t leader_id,
                                             uint64_t term) {
   leader_id_.store(leader_id);
   current_term_.store(term);
+  LOG(ERROR) << "[RAFT] Replica " << config_.GetSelfInfo().id()
+               << " recognizes leader " << leader_id << " for term " << term;
 }
 
 int ConsensusManagerRaft::HandleClientRequest(
@@ -144,7 +167,7 @@ int ConsensusManagerRaft::HandleClientRequest(
   if (client_request_handler_) {
     return client_request_handler_(std::move(context), std::move(request));
   }
-  LOG(WARNING) << "Client request arrived but RAFT core handler is not set yet.";
+  LOG(ERROR) << "Client request arrived but RAFT core handler is not set yet.";
   return -1;
 }
 
@@ -180,10 +203,16 @@ int ConsensusManagerRaft::HandleCustomConsensus(
                << request->user_type();
     return -1;
   }
+<<<<<<< HEAD
+  LOG(ERROR) << "[RAFT] Replica " << config_.GetSelfInfo().id()
+             << " received RAFT custom message seq=" << request->seq()
+             << " type=" << request->user_type();
+=======
   LOG(ERROR) << "[RAFT_RPC] NODE " << config_.GetSelfInfo().id()
              << " received custom consensus message user_type="
              << request->user_type()
              << " from sender=" << request->sender_id();
+>>>>>>> master
   if (consensus_message_handler_) {
     return consensus_message_handler_(std::move(context), std::move(request));
   }
@@ -215,14 +244,47 @@ void ConsensusManagerRaft::HeartbeatLoop() {
   while (heartbeat_running_) {
     lk.unlock();
     if (heartbeat_task_) {
-      LOG(ERROR) << "[RAFT] NODE " << config_.GetSelfInfo().id()
-                 << " HeartbeatLoop tick, current_leader="
-                 << leader_id_.load() << " term=" << current_term_.load();
-      heartbeat_task_();
+      // Run the heartbeat task in a fire-and-forget fashion so a blocked send
+      // does not stall the ticker thread. Skip if the previous heartbeat is
+      // still in flight.
+      bool expected = false;
+      if (heartbeat_task_active_.compare_exchange_strong(expected, true)) {
+        heartbeat_inflight_started_ns_.store(
+            absl::ToUnixNanos(absl::Now()), std::memory_order_relaxed);
+        std::thread([this]() {
+          try {
+            heartbeat_task_();
+          } catch (const std::exception& e) {
+            LOG(ERROR) << "[RAFT] heartbeat task threw exception: " << e.what();
+          } catch (...) {
+            LOG(ERROR) << "[RAFT] heartbeat task threw unknown exception";
+          }
+          heartbeat_inflight_started_ns_.store(0, std::memory_order_relaxed);
+          heartbeat_task_active_.store(false);
+        }).detach();
+      } else {
+        // Watchdog: if the in-flight heartbeat has taken too long, clear it so
+        // the ticker can continue.
+        uint64_t start_ns =
+            heartbeat_inflight_started_ns_.load(std::memory_order_relaxed);
+        uint64_t now_ns = absl::ToUnixNanos(absl::Now());
+        const uint64_t max_ns =
+            absl::ToInt64Nanoseconds(absl::Milliseconds(500));
+        if (start_ns > 0 && now_ns > start_ns &&
+            (now_ns - start_ns) > max_ns) {
+          LOG(ERROR)
+              << "[RAFT] heartbeat stuck for "
+              << (now_ns - start_ns) / 1000000
+              << "ms; clearing in-flight flag to continue ticks";
+          heartbeat_task_active_.store(false);
+          heartbeat_inflight_started_ns_.store(0, std::memory_order_relaxed);
+        } else {
+          LOG(ERROR)
+              << "[RAFT] skipping heartbeat: previous send still active";
+        }
+      }
     }
     lk.lock();
-    // Use a shorter heartbeat interval than the minimum election timeout so
-    // that a healthy leader can keep followers from starting elections.
     heartbeat_cv_.wait_for(lk, std::chrono::milliseconds(200), [this]() {
       return !heartbeat_running_;
     });

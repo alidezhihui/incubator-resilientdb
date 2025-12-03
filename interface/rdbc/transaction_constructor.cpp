@@ -20,8 +20,30 @@
 #include "interface/rdbc/transaction_constructor.h"
 
 #include <glog/logging.h>
+#include <google/protobuf/descriptor.h>
+#include <set>
 
 namespace resdb {
+
+namespace {
+
+bool IsNotLeaderResponse(const google::protobuf::Message& response) {
+  const auto* descriptor = response.GetDescriptor();
+  const auto* reflection = response.GetReflection();
+  if (descriptor == nullptr || reflection == nullptr) {
+    return false;
+  }
+  const auto* value_field = descriptor->FindFieldByName("value");
+  if (value_field == nullptr ||
+      value_field->cpp_type() !=
+          google::protobuf::FieldDescriptor::CPPTYPE_STRING) {
+    return false;
+  }
+  const std::string value = reflection->GetString(response, value_field);
+  return value == "NOT_LEADER";
+}
+
+}  // namespace
 
 TransactionConstructor::TransactionConstructor(const ResDBConfig& config)
     : NetChannel("", 0),
@@ -29,6 +51,8 @@ TransactionConstructor::TransactionConstructor(const ResDBConfig& config)
       timeout_ms_(
           config.GetClientTimeoutMs()) {  // default 2s for process timeout
   socket_->SetRecvTimeout(timeout_ms_);
+  // Fail fast on a replica and move to the next one.
+  SetMaxRetryCount(1);
 }
 
 absl::StatusOr<std::string> TransactionConstructor::GetResponseData(
@@ -62,26 +86,75 @@ absl::StatusOr<std::string> TransactionConstructor::GetResponseData(
 
 int TransactionConstructor::SendRequest(
     const google::protobuf::Message& message, Request::Type type) {
-  // Use the replica obtained from the server.
-  NetChannel::SetDestReplicaInfo(config_.GetReplicaInfos()[0]);
-  return NetChannel::SendRequest(message, type, false);
+  const auto& replicas = config_.GetReplicaInfos();
+  if (replicas.empty()) {
+    LOG(ERROR) << "client config contains no replicas";
+    return -1;
+  }
+  const size_t replica_count = replicas.size();
+  size_t start_index = next_replica_index_.load();
+  if (start_index >= replica_count) {
+    start_index = 0;
+  }
+  for (size_t offset = 0; offset < replica_count; ++offset) {
+    const auto& replica = replicas[(start_index + offset) % replica_count];
+    NetChannel::SetDestReplicaInfo(replica);
+    int ret = NetChannel::SendRequest(message, type, false);
+    if (ret >= 0) {
+      next_replica_index_.store((start_index + offset) % replica_count);
+      return ret;
+    }
+    // Close the socket so the next attempt re-establishes a connection.
+    Close();
+    LOG(WARNING) << "send request to replica " << replica.id()
+                 << " failed, trying next replica";
+  }
+  return -1;
 }
 
 int TransactionConstructor::SendRequest(
     const google::protobuf::Message& message,
     google::protobuf::Message* response, Request::Type type) {
-  NetChannel::SetDestReplicaInfo(config_.GetReplicaInfos()[0]);
-  int ret = NetChannel::SendRequest(message, type, true);
-  if (ret == 0) {
-    std::string resp_str;
-    int ret = NetChannel::RecvRawMessageData(&resp_str);
-    if (ret >= 0) {
-      if (!response->ParseFromString(resp_str)) {
-        LOG(ERROR) << "parse response fail:" << resp_str.size();
-        return -2;
-      }
-      return 0;
+  const auto& replicas = config_.GetReplicaInfos();
+  if (replicas.empty()) {
+    LOG(ERROR) << "client config contains no replicas";
+    return -1;
+  }
+  const size_t replica_count = replicas.size();
+  size_t start_index = next_replica_index_.load();
+  if (start_index >= replica_count) {
+    start_index = 0;
+  }
+  for (size_t offset = 0; offset < replica_count; ++offset) {
+    const auto& replica = replicas[(start_index + offset) % replica_count];
+    NetChannel::SetDestReplicaInfo(replica);
+    int ret = NetChannel::SendRequest(message, type, true);
+    if (ret < 0) {
+      Close();
+      LOG(WARNING) << "send request to replica " << replica.id()
+                   << " failed, trying next replica";
+      continue;
     }
+    std::string resp_str;
+    ret = NetChannel::RecvRawMessageData(&resp_str);
+    if (ret < 0) {
+      Close();
+      LOG(WARNING) << "recv response from replica " << replica.id()
+                   << " failed, trying next replica";
+      continue;
+    }
+    if (!response->ParseFromString(resp_str)) {
+      LOG(ERROR) << "parse response fail:" << resp_str.size();
+      return -2;
+    }
+    if (IsNotLeaderResponse(*response)) {
+      Close();
+      LOG(WARNING) << "replica " << replica.id()
+                   << " is not leader, trying next replica";
+      continue;
+    }
+    next_replica_index_.store((start_index + offset) % replica_count);
+    return 0;
   }
   return -1;
 }
